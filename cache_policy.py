@@ -5,6 +5,9 @@ from vllm.block import BlockTable, PhysicalTokenBlock
 POOLSIZE = 100
 
 class prefix_dict_list:
+    """
+    This class is used to heap the blocks by prefix length.
+    """
     def __init__(
         self,
     ) -> None:
@@ -51,6 +54,9 @@ class prefix_dict_list:
         return len(self.prefix_length_heap)
     
 class accessed_time_dict_list:
+    """
+    This class is used to heap the blocks by last access time.
+    """
     def __init__(
         self,
     ) -> None:
@@ -93,6 +99,13 @@ class accessed_time_dict_list:
 
     
 class CachePool:
+    """
+    The cache pool class, which has pool_size caches. We keep adding
+    caches to the pool when free the blocks until we get reach the maximum
+    size. When reach the maximum pool size, the cache pool starts to remove
+    the item from the pool by the policy below. (1) First priority based on
+    last accessed time. (2) Second priority based on the prefix length.
+    """
     def __init__(
         self,
         pool_size = POOLSIZE

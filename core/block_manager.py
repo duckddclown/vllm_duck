@@ -46,6 +46,7 @@ class BlockAllocator:
         return block
 
     def free(self, block: PhysicalTokenBlock) -> Optional[int]:
+        ## Change this function a little bit.
         if block.ref_count == 0:
             raise ValueError(f"Double free! {block} is already freed.")
         block.ref_count -= 1
@@ -157,8 +158,7 @@ class BlockSpaceManager:
         prefix_block_table: BlockTable = []
         num_prefix_blocks = 0
 
-        ## Calculate the prefix and hash value for each sequence.
-        ## Assume that all sequences in the group have the same prompt.
+        ## Start: Assign hash value to both virtual blocks and physical blocks.
         logical_token_blocks = seq.logical_token_blocks
         hash_per_block = []
         prev_block = None
@@ -172,12 +172,14 @@ class BlockSpaceManager:
             block.hash_val = hash_val
             hash_per_block.append(hash_val)
             prev_block = block
+        ## End
 
         prefix = seq_group.prefix
         if prefix is not None and prefix.allocated:
             # Prefix has already been allocated. Use the existing block table.
             num_prompt_blocks -= prefix.get_num_blocks()
 
+        ## Start: This will not be used, since we close the prefix technique implemented by them.
             ## Include the index.
             for i, block in enumerate(prefix.block_table):
                 block.ref_count += seq_group.num_seqs()
@@ -192,6 +194,7 @@ class BlockSpaceManager:
                 else:
                     self.gpu_allocator.cache_pool.remove_block(block)
                 block_table.append(block)
+        ## End
 
         ## Initialize the offset.
         i = 0
@@ -206,6 +209,10 @@ class BlockSpaceManager:
                     and logical_idx >= self.block_sliding_window):
                 block = block_table[logical_idx % self.block_sliding_window]
             else:
+
+            ## Start: Check whether the coming new prompt is in the hash table.
+            ## If it is in the hash table, then not need to assign new blocks, instead
+            ## remove the block from the cache pool if it is in it(Because we might have freed it).
                 ## Update the hash table.
                 self.total_seq += 1
                 hash_val_i = hash_per_block[i + base_len]
@@ -221,7 +228,8 @@ class BlockSpaceManager:
                     self.gpu_allocator.cache_pool.remove_block(block)
                     block.ref_count += seq_group.num_seqs()
                     block.last_accessed_time = time.time()
-        
+            ## End
+
             # Set the reference counts of the token blocks.
             block_table.append(block)
 
@@ -240,6 +248,7 @@ class BlockSpaceManager:
 
         # Assign the block table for each sequence.
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
+            ## Set the per sequence hash_lists for convinient access.
             self.hash_lists[seq.seq_id] = hash_per_block.copy()
             self.block_tables[seq.seq_id] = block_table.copy()
 
@@ -252,11 +261,10 @@ class BlockSpaceManager:
 
     def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
         """Allocate a physical slot for a new token."""
+
+        ## Now we are going to use both block_table and hash_list.
         logical_blocks = seq.logical_token_blocks
         block_table = self.block_tables[seq.seq_id]
-
-        # block_table = self.block_tables[seq.seq_id]
-        ## Use the hash_list to replace block_table.
         hash_list = self.hash_lists[seq.seq_id]
         self.total_seq += 1
 
@@ -271,7 +279,10 @@ class BlockSpaceManager:
                 # The sequence has a new logical block.
                 # Allocate a new physical block.
 
-                ## Update the hash table and block information.
+                ## Start: Update the hash table and block information for the coming new
+                ## block. The same as before, if the block is already in the hash table,
+                ## then no need to allocate new blocks. However, we do need to care about
+                ## the hit rate and ref_count.
                 last_block = seq.logical_token_blocks[-1]
                 last_2_block = seq.logical_token_blocks[-2]
                 token_ids = last_2_block.get_token_ids()
@@ -289,6 +300,7 @@ class BlockSpaceManager:
                     block = self.hash_table[hash_val]
                     self.gpu_allocator.cache_pool.remove_block(block)
                     block.ref_count += 1
+                    ## Update the latest access time.
                     block.last_accessed_time = time.time()
 
                 self.hash_lists[seq.seq_id].append(hash_val)
@@ -309,10 +321,16 @@ class BlockSpaceManager:
         hash_list[-1] = hash_val
         
         assert last_block.device == Device.GPU
+
+        ## Start: Change key of the hash table. I choose a different strategy
+        ## compared with the requirement. I also introduce hash value to the
+        ## unfilled partial blocks. In this case, I need to change the hash value
+        ## whenever we append the new slot. This may cause computation overhead
+        ## though, but this part is not hard to remove so I implement it :).
         if last_block.ref_count == 1:
+            ## In this case, only need to deal with the current block.
             # Not shared with other sequences. Appendable.
 
-            ## Change key of the hash table.
             if (hash_val not in self.hash_table):
                 self.hash_table[hash_val] = self.hash_table.pop(last_hash_val)
             else:
@@ -327,6 +345,9 @@ class BlockSpaceManager:
         else:
             # The last block is shared with other sequences.
             # Copy on Write: Allocate a new block and copy the tokens.
+            ## In this case, we need to copy on write. As stated before,
+            ## care about the situation with in hash table and not in
+            ## hash table.
             if (hash_val not in self.hash_table):
                 new_block = self.gpu_allocator.allocate()
                 new_block.prefix_length = last_block.prefix_length
@@ -344,6 +365,7 @@ class BlockSpaceManager:
                 block_table[-1] = new_block
                 self.gpu_allocator.free(last_block)
                 return None
+        ## End
 
     ## Needs further implementation.
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
@@ -476,6 +498,10 @@ class BlockSpaceManager:
 
     ## Totally Change this function.
     def _free_block_table(self, block_table: BlockTable) -> Optional[int]:
+        ## Now this function has a return value, which is the true blocks
+        ## to be freed. (Since the removed blocks could be inserted into
+        ## the cache pool, and the truly removed ones are those that are
+        ## removed from the cache pool by eviction policy).
         hash_val_list = []
         for block in set(block_table):
             if block.device == Device.GPU:
